@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.env
+.DS_Store
+
+# Local agent context and configuration
+.agents/
+.ai-factory/
+.ai-factory.json
+.codex/
+AGENTS.md
+CLAUDE.md
+RULES.md
