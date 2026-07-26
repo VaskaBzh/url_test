@@ -24,13 +24,3 @@ export interface Job {
   status: JobStatus;
   urlChecks: UrlCheck[];
 }
-
-/** Compact job shape returned by the job list endpoint. */
-export interface JobSummary {
-  id: string;
-  createdAt: string;
-  status: JobStatus;
-  totalUrls: number;
-  successfulUrls: number;
-  errorUrls: number;
-}

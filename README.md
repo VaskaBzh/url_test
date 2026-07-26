@@ -1,55 +1,82 @@
 # Async URL Checker
 
-NestJS API and Vue 3 client for asynchronous HEAD checks of URL lists. Job data lives in memory, so it is reset when the API restarts.
+> Run asynchronous HTTP HEAD checks for a list of URLs and inspect each result through a small web interface or REST API.
 
-## Stack
+The project combines a NestJS API with a Vue 3 + Pinia client. Jobs are processed in memory with bounded per-job concurrency, predictable validation errors, explicit lifecycle transitions, and configurable structured logging.
 
-- NestJS + TypeScript API
-- Vue 3 + TypeScript + Pinia client
-- Docker Compose for containerized execution
+## Quick Start
 
-## Run locally
-
-Use two terminals:
+Install dependencies:
 
 ```bash
-cd server
-npm install
-npm run start:dev
+npm --prefix server install
+npm --prefix client install
+```
+
+Start the API and client in separate terminals:
+
+```bash
+npm --prefix server run start:dev
 ```
 
 ```bash
-cd client
-npm install
-npm run dev
+npm --prefix client run dev
 ```
 
-Open `http://localhost:5173`. The Vite development server proxies `/api` requests to NestJS on port 3000.
+Open `http://localhost:5173`. The API listens on `http://localhost:3000/api`.
 
-### Makefile
-
-If `make` is available, run both development servers with:
-
-```bash
-make install
-make dev
-```
-
-The Vue client is available at `http://localhost:5173`; the NestJS API listens on `http://localhost:3000`.
-
-## Docker
+For a production-style local run:
 
 ```bash
 docker compose up --build
 ```
 
-The API listens on port 3000. For the production image, serve the generated `client/dist` directory from a web server or reverse proxy.
+Open `http://localhost:3000`; the container serves both the built client and the API.
 
-## API
+## Key Features
 
-- `POST /api/jobs` — `{ "urls": ["https://example.com"] }`
-- `GET /api/jobs` — job summaries and aggregate statistics
-- `GET /api/jobs/:id` — URL-level status, response code, errors, and timing
-- `DELETE /api/jobs/:id` — cancels pending URLs in the job
+- **Asynchronous jobs** — submit multiple URLs and poll job-level and URL-level progress.
+- **Bounded processing** — each job runs at most five HEAD requests concurrently.
+- **Stable API contracts** — invalid payloads return predictable `400` responses; unknown jobs return generic `404` responses.
+- **Explicit lifecycle rules** — job and URL transitions are validated before state changes.
+- **Safe cancellation** — pending URLs are cancelled while already-started requests may finish.
+- **Configurable logs** — choose verbose, standard, or minimal output with `LOG_LEVEL`.
 
-Each job uses at most five simultaneous HEAD requests. Completed HTTP requests wait for a random 0–10 second delay before their results are saved.
+## Example
+
+Create a job:
+
+```bash
+curl -X POST http://localhost:3000/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"urls":["https://example.com","https://openai.com"]}'
+```
+
+Response:
+
+```json
+{"jobId":"73d86e28-3018-4d7b-8c10-7d5b2fb43e9a"}
+```
+
+## Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [API Reference](docs/api.md) | Endpoints, validation, responses, and lifecycle |
+| [Configuration](docs/configuration.md) | Environment variables, logging, and runtime limits |
+
+## Verification
+
+```bash
+npm --prefix server run lint
+npm --prefix server test -- --runInBand
+npm --prefix server run test:e2e -- --runInBand
+npm --prefix server run build
+npm --prefix client run build
+```
+
+Job history is process-local and is cleared whenever the API restarts.
+
+## License
+
+This repository is private and unlicensed (`UNLICENSED`).

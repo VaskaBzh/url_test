@@ -1,4 +1,4 @@
-/** Request payload used to create an asynchronous URL checking job. */
+/** Validated request payload used to create an asynchronous URL-checking job. */
 export interface CreateJobDto {
-  urls: unknown;
+  readonly urls: readonly string[];
 }
