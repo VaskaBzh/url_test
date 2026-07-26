@@ -1,8 +1,10 @@
-import { Module } from '@nestjs/common';
+﻿import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { minutes, ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { HeadRequestService } from './jobs/head-request.service';
 import { JobsController } from './jobs/jobs.controller';
 import { JobsService } from './jobs/jobs.service';
+import { ResultDelayService } from './jobs/result-delay.service';
 import { UrlSafetyService } from './jobs/url-safety.service';
 
 @Module({
@@ -14,7 +16,9 @@ import { UrlSafetyService } from './jobs/url-safety.service';
   ],
   controllers: [JobsController],
   providers: [
+    HeadRequestService,
     JobsService,
+    ResultDelayService,
     UrlSafetyService,
     { provide: APP_GUARD, useClass: ThrottlerGuard },
   ],

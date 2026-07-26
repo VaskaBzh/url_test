@@ -1,4 +1,4 @@
-import { createPinia, setActivePinia } from 'pinia';
+﻿import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cancelJob, createJob, getJob, getJobs } from '../api/jobs.api';
 import { createDeferredPromise } from '../test/deferred';
@@ -10,6 +10,7 @@ vi.mock('../api/jobs.api', () => ({
   createJob: vi.fn(),
   getJob: vi.fn(),
   getJobs: vi.fn(),
+  isAbortError: vi.fn((error: unknown) => error instanceof Error && error.name === 'AbortError'),
 }));
 
 const mockedCancelJob = vi.mocked(cancelJob);
@@ -47,13 +48,16 @@ describe('useJobsStore core actions', () => {
     { reason: new Error('Job list is unavailable.'), expectedMessage: 'Job list is unavailable.' },
     { reason: 'unstructured failure', expectedMessage: 'Unable to complete the request.' },
   ])('records a safe error when loading jobs rejects with $reason', async ({ reason, expectedMessage }) => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const store = useJobsStore();
     mockedGetJobs.mockRejectedValue(reason);
 
     await store.loadJobs();
 
     expect(store.errorMessage).toBe(expectedMessage);
+    expect(store.listErrorMessage).toBe(expectedMessage);
     expect(store.isLoadingJobs).toBe(false);
+    expect(consoleErrorSpy).toHaveBeenCalledOnce();
   });
 
   it('rejects whitespace-only submission without calling the API', async () => {
@@ -155,6 +159,7 @@ describe('useJobsStore core actions', () => {
   });
 
   it('records cancellation errors and always resets cancellation state', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const store = useJobsStore();
     store.activeJobId = 'job-1';
     mockedCancelJob.mockRejectedValue(new Error('Cancellation failed.'));
@@ -162,9 +167,152 @@ describe('useJobsStore core actions', () => {
     await store.cancelActiveJob();
 
     expect(store.errorMessage).toBe('Cancellation failed.');
+    expect(store.cancellationErrorMessage).toBe('Cancellation failed.');
     expect(store.isCancelling).toBe(false);
+    expect(consoleErrorSpy).toHaveBeenCalledOnce();
+  });
+
+  it('guards against duplicate submissions while the first request is pending', async () => {
+    const creationRequest = createDeferredPromise<{ jobId: string }>();
+    mockedCreateJob.mockReturnValue(creationRequest.promise);
+    mockedGetJob.mockResolvedValue(createJobDetails({ id: 'created-job', status: 'completed' }));
+    const store = useJobsStore();
+
+    const firstSubmission = store.submitJob('https://example.com');
+    const secondSubmission = store.submitJob('https://example.com');
+    creationRequest.resolve({ jobId: 'created-job' });
+
+    await expect(firstSubmission).resolves.toBe(true);
+    await expect(secondSubmission).resolves.toBe(false);
+    expect(mockedCreateJob).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('useJobsStore workflow ownership', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.resetAllMocks();
+    mockedGetJobs.mockResolvedValue([]);
+  });
+
+  it('keeps the newly selected job when an older request resolves later', async () => {
+    const firstJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    const secondJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    mockedGetJob.mockImplementation((jobId) => jobId === 'job-a' ? firstJobRequest.promise : secondJobRequest.promise);
+    const store = useJobsStore();
+
+    const firstSelection = store.selectJob('job-a');
+    const secondSelection = store.selectJob('job-b');
+    const secondDetails = createJobDetails({ id: 'job-b', status: 'completed' });
+    secondJobRequest.resolve(secondDetails);
+    await secondSelection;
+    firstJobRequest.resolve(createJobDetails({ id: 'job-a', status: 'completed' }));
+    await firstSelection;
+
+    expect(store.activeJob?.id).toBe('job-b');
+    expect(store.activeJob).toEqual(secondDetails);
+    expect(store.isLoadingDetails).toBe(false);
+  });
+
+  it('rejects an obsolete same-id response after selecting A, B, then A', async () => {
+    const firstJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    const secondJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    const thirdJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    mockedGetJob
+      .mockReturnValueOnce(firstJobRequest.promise)
+      .mockReturnValueOnce(secondJobRequest.promise)
+      .mockReturnValueOnce(thirdJobRequest.promise);
+    const store = useJobsStore();
+
+    const firstSelection = store.selectJob('job-a');
+    const secondSelection = store.selectJob('job-b');
+    const thirdSelection = store.selectJob('job-a');
+    firstJobRequest.resolve(createJobDetails({ id: 'obsolete-job-a', status: 'completed' }));
+    await firstSelection;
+
+    expect(store.activeJob).toBeNull();
+    expect(store.isLoadingDetails).toBe(true);
+
+    thirdJobRequest.resolve(createJobDetails({ id: 'job-a', status: 'completed' }));
+    await thirdSelection;
+    secondJobRequest.resolve(createJobDetails({ id: 'job-b', status: 'completed' }));
+    await secondSelection;
+
+    expect(store.activeJob?.id).toBe('job-a');
+    expect(store.isLoadingDetails).toBe(false);
+  });
+
+  it('does not expose or log an error from an obsolete details request', async () => {
+    const firstJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    const secondJobRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
+    mockedGetJob.mockImplementation((jobId) => jobId === 'job-a' ? firstJobRequest.promise : secondJobRequest.promise);
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const store = useJobsStore();
+
+    const firstSelection = store.selectJob('job-a');
+    const secondSelection = store.selectJob('job-b');
+    secondJobRequest.resolve(createJobDetails({ id: 'job-b', status: 'completed' }));
+    await secondSelection;
+    firstJobRequest.reject(new Error('obsolete failure'));
+    await firstSelection;
+
+    expect(store.detailsErrorMessage).toBeNull();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps the latest list response when refreshes overlap', async () => {
+    const firstListRequest = createDeferredPromise<ReturnType<typeof createJobSummary>[]>();
+    const secondListRequest = createDeferredPromise<ReturnType<typeof createJobSummary>[]>();
+    mockedGetJobs
+      .mockReturnValueOnce(firstListRequest.promise)
+      .mockReturnValueOnce(secondListRequest.promise);
+    const store = useJobsStore();
+
+    const firstRefresh = store.loadJobs();
+    const secondRefresh = store.loadJobs();
+    secondListRequest.resolve([createJobSummary({ id: 'new-job' })]);
+    await secondRefresh;
+    firstListRequest.resolve([createJobSummary({ id: 'old-job' })]);
+    await firstRefresh;
+
+    expect(store.jobs.map(({ id }) => id)).toEqual(['new-job']);
+    expect(store.isLoadingJobs).toBe(false);
+  });
+
+  it('does not refresh or transfer cancellation state after selection changes', async () => {
+    mockedGetJob.mockImplementation(async (jobId) => createJobDetails({ id: jobId, status: 'completed' }));
+    const cancellationRequest = createDeferredPromise<void>();
+    mockedCancelJob.mockReturnValue(cancellationRequest.promise);
+    const store = useJobsStore();
+    await store.selectJob('job-a');
+
+    const cancellation = store.cancelActiveJob();
+    await store.selectJob('job-b');
+    cancellationRequest.resolve(undefined);
+    await cancellation;
+
+    expect(store.activeJob?.id).toBe('job-b');
+    expect(store.isCancelling).toBe(false);
+    expect(store.cancellationErrorMessage).toBeNull();
+    expect(mockedGetJob).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs one safe error for the current failed list request', async () => {
+    mockedGetJobs.mockRejectedValue(new Error('response body must stay private'));
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const store = useJobsStore();
+
+    await store.loadJobs();
+
+    expect(store.listErrorMessage).toBe('response body must stay private');
+    expect(consoleErrorSpy).toHaveBeenCalledOnce();
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '[workflow.loadJobs] Request failed',
+      { jobId: undefined, errorName: 'Error' },
+    );
+  });
+});
+
 describe('useJobsStore polling isolation', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
@@ -210,30 +358,6 @@ describe('useJobsStore polling isolation', () => {
     expect(mockedGetJob).toHaveBeenCalledTimes(1);
   });
 
-  it('ignores details that resolve after a newer job is selected', async () => {
-    const store = useJobsStore();
-    const firstDetailsRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
-    const secondDetailsRequest = createDeferredPromise<ReturnType<typeof createJobDetails>>();
-    mockedGetJob.mockImplementation((jobId) => {
-      return jobId === 'job-a' ? firstDetailsRequest.promise : secondDetailsRequest.promise;
-    });
-
-    const firstSelectionPromise = store.selectJob('job-a');
-    const secondSelectionPromise = store.selectJob('job-b');
-    const secondDetails = createJobDetails({ id: 'job-b', status: 'completed' });
-    secondDetailsRequest.resolve(secondDetails);
-    await secondSelectionPromise;
-
-    firstDetailsRequest.resolve(createJobDetails({ id: 'job-a', status: 'in_progress' }));
-    await firstSelectionPromise;
-    await vi.advanceTimersByTimeAsync(1_500);
-
-    expect(store.activeJobId).toBe('job-b');
-    expect(store.activeJob).toEqual(secondDetails);
-    expect(store.isLoadingDetails).toBe(false);
-    expect(mockedGetJob).toHaveBeenCalledTimes(2);
-  });
-
   it('does not schedule an obsolete poll after an older list refresh resolves', async () => {
     const store = useJobsStore();
     const firstListRequest = createDeferredPromise<ReturnType<typeof createJobSummary>[]>();
@@ -264,6 +388,7 @@ describe('useJobsStore polling isolation', () => {
   });
 
   it('records polling errors without leaving details loading', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const store = useJobsStore();
     mockedGetJob.mockRejectedValue(new Error('Polling failed.'));
 
@@ -271,5 +396,7 @@ describe('useJobsStore polling isolation', () => {
 
     expect(store.errorMessage).toBe('Polling failed.');
     expect(store.isLoadingDetails).toBe(false);
+    expect(consoleErrorSpy).toHaveBeenCalledOnce();
   });
 });
+

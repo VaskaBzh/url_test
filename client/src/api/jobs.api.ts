@@ -35,6 +35,11 @@ function toClientErrorMessage(httpStatus: number): string {
   return 'Unable to complete the request.';
 }
 
+/** Identifies request cancellation so obsolete workflows can finish silently. */
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
 /** Creates a new URL checking job. */
 export function createJob(urls: string[]): Promise<{ jobId: string }> {
   return request('/jobs', {
@@ -45,13 +50,13 @@ export function createJob(urls: string[]): Promise<{ jobId: string }> {
 }
 
 /** Gets summaries for every job currently held by the server. */
-export function getJobs(): Promise<JobSummary[]> {
-  return request('/jobs');
+export function getJobs(signal?: AbortSignal): Promise<JobSummary[]> {
+  return request('/jobs', { signal });
 }
 
 /** Gets all individual URL checks for a job. */
-export function getJob(id: string): Promise<JobDetails> {
-  return request(`/jobs/${id}`);
+export function getJob(id: string, signal?: AbortSignal): Promise<JobDetails> {
+  return request(`/jobs/${id}`, { signal });
 }
 
 /** Cancels a job without aborting already in-flight HTTP checks. */

@@ -6,6 +6,20 @@ export type JobStatus =
 export type UrlCheckStatus =
   'pending' | 'in_progress' | 'success' | 'error' | 'cancelled';
 
+/** Result returned by the HTTP boundary without exposing transport exceptions. */
+export type HeadRequestOutcome =
+  | {
+      kind: 'success';
+      httpStatus: number;
+    }
+  | {
+      kind: 'error';
+      errorMessage: string;
+    };
+
+/** Internal stage that detected a job-level processing failure. */
+export type JobProcessingFailureStage = 'worker' | 'detached_boundary';
+
 /** Mutable in-memory representation of an individual URL check. */
 export interface UrlCheck {
   url: string;

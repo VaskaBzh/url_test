@@ -1,4 +1,4 @@
-import {
+﻿import {
   BadRequestException,
   Injectable,
   Logger,
@@ -6,11 +6,15 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { request, type RequestOptions } from 'node:http';
-import { request as secureRequest } from 'node:https';
-import type { LookupFunction } from 'node:net';
-import { Job, JobStatus, JobSummary, UrlCheck } from './jobs.types';
-import { UnsafeUrlTargetError, UrlSafetyService } from './url-safety.service';
+import { HeadRequestService } from './head-request.service';
+import type {
+  Job,
+  JobProcessingFailureStage,
+  JobStatus,
+  JobSummary,
+  UrlCheck,
+} from './jobs.types';
+import { ResultDelayService } from './result-delay.service';
 
 const MAX_CONCURRENT_CHECKS_PER_JOB = 5;
 const MAX_GLOBAL_CONCURRENT_REQUESTS = 20;
@@ -18,30 +22,26 @@ const MAX_PENDING_URL_CHECKS = 1_000;
 const MAX_STORED_JOBS = 100;
 const MAX_URLS_PER_JOB = 50;
 const MAX_URL_LENGTH = 2_048;
-const REQUEST_TIMEOUT_MS = 15_000;
-const MAX_RESULT_DELAY_MS = 10_000;
-
-class UrlRequestTimeoutError extends Error {
-  constructor() {
-    super('Request timed out.');
-    this.name = UrlRequestTimeoutError.name;
-  }
-}
+const INTERNAL_PROCESSING_ERROR_MESSAGE = 'Internal job processing error';
 
 /**
- * Stores jobs in memory and executes URL checks within process-wide resource limits.
+ * Stores jobs in memory and executes URL checks in independent, bounded queues.
  * Jobs are intentionally process-local: restarting the server clears their history.
  */
 @Injectable()
 export class JobsService {
   private readonly jobs = new Map<string, Job>();
+  private readonly jobsWithProcessingFailure = new Set<string>();
   private readonly logger = new Logger(JobsService.name);
   private activeRequestCount = 0;
   private readonly requestWaiters: Array<() => void> = [];
 
-  constructor(private readonly urlSafetyService: UrlSafetyService) {}
+  constructor(
+    private readonly headRequestService: HeadRequestService,
+    private readonly resultDelayService: ResultDelayService,
+  ) {}
 
-  /** Validates submitted URLs, reserves bounded capacity, and schedules background processing. */
+  /** Validates submitted URLs, stores the job, and schedules its non-blocking processor. */
   create(rawUrls: unknown): { jobId: string } {
     const urls = this.validateUrls(rawUrls);
     this.ensureJobCapacity();
@@ -55,12 +55,14 @@ export class JobsService {
     };
 
     this.jobs.set(job.id, job);
-    this.logAcceptedJob(job);
+    this.logger.debug({
+      event: 'job_created',
+      jobId: job.id,
+      state: job.status,
+      urlCount: job.urlChecks.length,
+    });
     void this.processJob(job).catch((error: unknown) => {
-      job.status = 'failed';
-      this.logger.error(
-        `[FIX:resource-limits] Job processor failed jobId=${job.id} reason=${this.toErrorReason(error)}`,
-      );
+      this.handleJobProcessingFailure(job, error, 'detached_boundary');
     });
     return { jobId: job.id };
   }
@@ -83,12 +85,28 @@ export class JobsService {
   /** Marks queued checks cancelled while allowing already-started HTTP requests to finish safely. */
   cancel(id: string): void {
     const job = this.getJobOrThrow(id);
-    if (this.isTerminal(job.status)) return;
+    if (this.isTerminal(job.status)) {
+      this.logger.debug({
+        event: 'job_cancellation_skipped',
+        jobId: job.id,
+        state: job.status,
+      });
+      return;
+    }
 
     job.status = 'cancelled';
+    let cancelledUrlCount = 0;
     for (const urlCheck of job.urlChecks) {
-      if (urlCheck.status === 'pending') urlCheck.status = 'cancelled';
+      if (urlCheck.status === 'pending') {
+        urlCheck.status = 'cancelled';
+        cancelledUrlCount += 1;
+      }
     }
+    this.logger.log({
+      event: 'job_cancelled',
+      jobId: job.id,
+      cancelledUrlCount,
+    });
   }
 
   private async processJob(job: Job): Promise<void> {
@@ -96,100 +114,146 @@ export class JobsService {
     job.status = 'in_progress';
     let nextIndex = 0;
 
-    const worker = async (): Promise<void> => {
+    this.logger.debug({
+      event: 'job_processing_started',
+      jobId: job.id,
+      state: job.status,
+      urlCount: job.urlChecks.length,
+      workerCount: Math.min(
+        MAX_CONCURRENT_CHECKS_PER_JOB,
+        job.urlChecks.length,
+      ),
+    });
+
+    const worker = async (workerIndex: number): Promise<void> => {
       while (true) {
-        if (job.status === 'cancelled') return;
-        const urlCheck = job.urlChecks[nextIndex++];
+        if (this.shouldStopProcessing(job)) {
+          this.logger.debug({
+            event: 'job_worker_stopped',
+            jobId: job.id,
+            workerIndex,
+            reason: job.status === 'cancelled' ? 'job_cancelled' : 'job_failed',
+          });
+          return;
+        }
+        const urlIndex = nextIndex++;
+        const urlCheck = job.urlChecks[urlIndex];
         if (!urlCheck) return;
-        await this.processUrlCheck(job, urlCheck);
+        this.logger.debug({
+          event: 'job_worker_check_started',
+          jobId: job.id,
+          urlIndex,
+          workerIndex,
+        });
+        await this.processUrlCheck(job, urlCheck, urlIndex);
       }
     };
 
-    await Promise.all(
-      Array.from(
-        {
-          length: Math.min(MAX_CONCURRENT_CHECKS_PER_JOB, job.urlChecks.length),
-        },
-        worker,
-      ),
-    );
-    if (!this.wasCancelled(job)) job.status = 'completed';
-  }
-
-  private async processUrlCheck(job: Job, urlCheck: UrlCheck): Promise<void> {
-    const releaseRequestPermit = await this.acquireRequestPermit();
-    if (job.status === 'cancelled') {
-      urlCheck.status = 'cancelled';
-      releaseRequestPermit();
+    try {
+      await Promise.all(
+        Array.from(
+          {
+            length: Math.min(
+              MAX_CONCURRENT_CHECKS_PER_JOB,
+              job.urlChecks.length,
+            ),
+          },
+          worker,
+        ),
+      );
+    } catch (error: unknown) {
+      this.handleJobProcessingFailure(job, error, 'worker');
       return;
     }
 
-    urlCheck.status = 'in_progress';
-    urlCheck.startedAt = new Date().toISOString();
-    const startedAtMs = Date.now();
-    try {
-      urlCheck.httpStatus = await this.performHeadRequest(urlCheck.url);
-      urlCheck.status = 'success';
-    } catch (error: unknown) {
-      urlCheck.status = 'error';
-      urlCheck.errorMessage = this.toSafeUrlErrorMessage(error);
-      this.logUrlCheckFailure(job.id, urlCheck.url, error);
-    } finally {
-      releaseRequestPermit();
-    }
-
-    await this.delayResult();
-    urlCheck.completedAt = new Date().toISOString();
-    urlCheck.durationMs = Date.now() - startedAtMs;
+    if (this.shouldStopProcessing(job)) return;
+    job.status = 'completed';
+    this.logger.debug({
+      event: 'job_processing_completed',
+      jobId: job.id,
+      state: job.status,
+      successfulUrlCount: job.urlChecks.filter(
+        ({ status }) => status === 'success',
+      ).length,
+      errorUrlCount: job.urlChecks.filter(({ status }) => status === 'error')
+        .length,
+    });
   }
 
-  private async performHeadRequest(url: string): Promise<number> {
-    const parsedUrl = new URL(url);
-    const resolvedAddress =
-      await this.urlSafetyService.resolvePublicAddress(parsedUrl);
-    const pinnedLookup: LookupFunction = (_hostname, options, callback) => {
-      if (options.all) {
-        callback(null, [resolvedAddress]);
+  private async processUrlCheck(
+    job: Job,
+    urlCheck: UrlCheck,
+    urlIndex: number,
+  ): Promise<void> {
+    if (this.isCancelled(job)) {
+      urlCheck.status = 'cancelled';
+      return;
+    }
+
+    this.logger.debug({
+      event: 'url_check_state_changed',
+      jobId: job.id,
+      urlIndex,
+      previousState: urlCheck.status,
+      nextState: 'in_progress',
+    });
+    urlCheck.status = 'in_progress';
+    urlCheck.startedAt = new Date().toISOString();
+    const startedAtMilliseconds = Date.now();
+    const releaseRequestPermit = await this.acquireRequestPermit();
+
+    try {
+      if (this.isCancelled(job)) {
+        urlCheck.status = 'cancelled';
         return;
       }
-      callback(null, resolvedAddress.address, resolvedAddress.family);
-    };
-    const requestOptions: RequestOptions = {
-      agent: false,
-      lookup: pinnedLookup,
-      maxHeaderSize: 16_384,
-      method: 'HEAD',
-      timeout: REQUEST_TIMEOUT_MS,
-    };
 
-    return new Promise((resolve, reject) => {
-      const requestFactory =
-        parsedUrl.protocol === 'https:' ? secureRequest : request;
-      const clientRequest = requestFactory(
-        parsedUrl,
-        requestOptions,
-        (response) => {
-          response.resume();
-          resolve(response.statusCode ?? 0);
-        },
-      );
-      clientRequest.once('timeout', () =>
-        clientRequest.destroy(new UrlRequestTimeoutError()),
-      );
-      clientRequest.once('socket', (socket) => {
-        socket.once('connect', () => {
-          const remoteAddress = socket.remoteAddress;
-          if (
-            !remoteAddress ||
-            !this.urlSafetyService.isPublicAddress(remoteAddress)
-          ) {
-            clientRequest.destroy(new UnsafeUrlTargetError());
-          }
+      const requestOutcome = await this.headRequestService.check(urlCheck.url);
+      if (this.jobsWithProcessingFailure.has(job.id)) {
+        this.logger.debug({
+          event: 'url_check_result_discarded',
+          jobId: job.id,
+          urlIndex,
+          stage: 'after_request',
         });
+        return;
+      }
+
+      await this.resultDelayService.wait();
+      if (this.jobsWithProcessingFailure.has(job.id)) {
+        this.logger.debug({
+          event: 'url_check_result_discarded',
+          jobId: job.id,
+          urlIndex,
+          stage: 'after_delay',
+        });
+        return;
+      }
+
+      if (requestOutcome.kind === 'success') {
+        urlCheck.httpStatus = requestOutcome.httpStatus;
+        urlCheck.status = 'success';
+      } else {
+        urlCheck.errorMessage = requestOutcome.errorMessage;
+        urlCheck.status = 'error';
+        this.logger.warn({
+          event: 'url_check_transport_failed',
+          jobId: job.id,
+          urlIndex,
+          errorType: 'transport',
+        });
+      }
+      this.logger.debug({
+        event: 'url_check_result_published',
+        jobId: job.id,
+        urlIndex,
+        state: urlCheck.status,
       });
-      clientRequest.once('error', reject);
-      clientRequest.end();
-    });
+    } finally {
+      releaseRequestPermit();
+      urlCheck.completedAt ??= new Date().toISOString();
+      urlCheck.durationMs ??= Date.now() - startedAtMilliseconds;
+    }
   }
 
   private acquireRequestPermit(): Promise<() => void> {
@@ -211,9 +275,83 @@ export class JobsService {
     this.requestWaiters.shift()?.();
   }
 
-  private async delayResult(): Promise<void> {
-    const delayMs = Math.floor(Math.random() * (MAX_RESULT_DELAY_MS + 1));
-    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  private handleJobProcessingFailure(
+    job: Job,
+    error: unknown,
+    failureStage: JobProcessingFailureStage,
+  ): void {
+    if (this.jobsWithProcessingFailure.has(job.id)) {
+      this.logger.debug({
+        event: 'job_processing_failure_already_handled',
+        jobId: job.id,
+        failureStage,
+      });
+      return;
+    }
+
+    this.jobsWithProcessingFailure.add(job.id);
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    const errorStack =
+      error instanceof Error ? (error.stack ?? error.message) : String(error);
+
+    if (job.status === 'cancelled') {
+      this.logger.warn({
+        event: 'job_processing_failure_after_cancellation',
+        jobId: job.id,
+        failureStage,
+        errorName,
+      });
+    } else {
+      job.status = 'failed';
+      this.logger.error(
+        {
+          event: 'job_processing_failed',
+          jobId: job.id,
+          failureStage,
+          errorName,
+        },
+        errorStack,
+      );
+    }
+
+    this.terminalizeNonterminalUrlChecks(job);
+  }
+
+  private terminalizeNonterminalUrlChecks(job: Job): void {
+    const completedAtMilliseconds = Date.now();
+    const completedAt = new Date(completedAtMilliseconds).toISOString();
+
+    job.urlChecks.forEach((urlCheck, urlIndex) => {
+      if (!['pending', 'in_progress'].includes(urlCheck.status)) return;
+
+      const previousState = urlCheck.status;
+      urlCheck.status = 'error';
+      urlCheck.errorMessage = INTERNAL_PROCESSING_ERROR_MESSAGE;
+      urlCheck.completedAt ??= completedAt;
+      if (urlCheck.startedAt && urlCheck.durationMs === undefined) {
+        const startedAtMilliseconds = Date.parse(urlCheck.startedAt);
+        if (Number.isFinite(startedAtMilliseconds)) {
+          urlCheck.durationMs = Math.max(
+            0,
+            completedAtMilliseconds - startedAtMilliseconds,
+          );
+        }
+      }
+
+      this.logger.debug({
+        event: 'url_check_terminalized_after_failure',
+        jobId: job.id,
+        urlIndex,
+        previousState,
+        nextState: urlCheck.status,
+      });
+    });
+  }
+
+  private shouldStopProcessing(job: Job): boolean {
+    return (
+      job.status === 'cancelled' || this.jobsWithProcessingFailure.has(job.id)
+    );
   }
 
   private validateUrls(rawUrls: unknown): string[] {
@@ -221,9 +359,6 @@ export class JobsService {
       throw new BadRequestException('urls must be a non-empty array');
     }
     if (rawUrls.length > MAX_URLS_PER_JOB) {
-      this.logger.warn(
-        `[FIX:resource-limits] Rejected URL count=${rawUrls.length} limit=${MAX_URLS_PER_JOB}`,
-      );
       throw new BadRequestException(
         `A job can contain at most ${MAX_URLS_PER_JOB} URLs`,
       );
@@ -267,7 +402,9 @@ export class JobsService {
     }
 
     if (this.jobs.size >= MAX_STORED_JOBS) {
-      this.rejectForCapacity('stored jobs');
+      throw new ServiceUnavailableException(
+        'The service is at capacity. Please try again later.',
+      );
     }
   }
 
@@ -282,17 +419,10 @@ export class JobsService {
     );
 
     if (outstandingUrlCount + requestedUrlCount > MAX_PENDING_URL_CHECKS) {
-      this.rejectForCapacity('pending URL checks');
+      throw new ServiceUnavailableException(
+        'The service is at capacity. Please try again later.',
+      );
     }
-  }
-
-  private rejectForCapacity(resourceName: string): never {
-    this.logger.warn(
-      `[FIX:resource-limits] Rejected job because ${resourceName} reached capacity`,
-    );
-    throw new ServiceUnavailableException(
-      'The service is at capacity. Please try again later.',
-    );
   }
 
   private getJobOrThrow(id: string): Job {
@@ -314,52 +444,11 @@ export class JobsService {
     };
   }
 
-  private toSafeUrlErrorMessage(error: unknown): string {
-    if (error instanceof UnsafeUrlTargetError) {
-      return 'URL target is not allowed.';
-    }
-    if (error instanceof UrlRequestTimeoutError) {
-      return 'Request timed out.';
-    }
-    return 'Unable to reach URL.';
-  }
-
-  private logUrlCheckFailure(jobId: string, url: string, error: unknown): void {
-    const hostname = new URL(url).hostname;
-    this.logger.warn(
-      `[FIX:url-check] Check failed jobId=${jobId} hostname=${hostname} reason=${this.toErrorReason(error)}`,
-    );
-  }
-
-  private toErrorReason(error: unknown): string {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      typeof error.code === 'string'
-    ) {
-      return error.code;
-    }
-    return error instanceof Error ? error.name : 'UnknownError';
-  }
-
-  private logAcceptedJob(job: Job): void {
-    if (
-      process.env.DEBUG_FIX !== '1' &&
-      process.env.LOG_LEVEL?.toLowerCase() !== 'debug'
-    ) {
-      return;
-    }
-    this.logger.debug(
-      `[FIX:resource-limits] Accepted jobId=${job.id} urlCount=${job.urlChecks.length}`,
-    );
-  }
-
   private isTerminal(status: JobStatus): boolean {
     return ['completed', 'cancelled', 'failed'].includes(status);
   }
 
-  private wasCancelled(job: Job): boolean {
+  private isCancelled(job: Job): boolean {
     return job.status === 'cancelled';
   }
 }
