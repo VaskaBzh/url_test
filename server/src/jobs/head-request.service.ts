@@ -26,7 +26,7 @@ export class HeadRequestService {
       parsedUrl.protocol === 'https:' ? secureRequest : request;
     const requestContext = {
       event: 'head_request',
-      origin: parsedUrl.origin,
+      protocol: parsedUrl.protocol.replace(':', ''),
     };
 
     this.logger.debug({ ...requestContext, state: 'started' });
@@ -64,7 +64,7 @@ export class HeadRequestService {
           errorMessage:
             error.message === 'Request timed out'
               ? 'Request timed out'
-              : `HEAD request failed (${errorCode})`,
+              : 'URL request failed',
         });
       });
       clientRequest.end();

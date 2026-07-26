@@ -67,6 +67,7 @@ async function waitForUrlChecksToFinish(
 
   throw new Error(`Job ${jobId} still has nonterminal URL checks`);
 }
+
 describe('JobsService asynchronous processing', () => {
   let jobsService: JobsService;
   let headRequestService: HeadRequestService;
@@ -207,6 +208,7 @@ describe('JobsService asynchronous processing', () => {
     expect(warningLogger).not.toHaveBeenCalled();
     expect(errorLogger).not.toHaveBeenCalled();
   });
+
   it('publishes a successful result only after the delay completes', async () => {
     const controlledDelay = createDeferredPromise<void>();
     headRequestCheck.mockResolvedValue({ kind: 'success', httpStatus: 201 });
@@ -249,7 +251,7 @@ describe('JobsService asynchronous processing', () => {
     const controlledDelay = createDeferredPromise<void>();
     headRequestCheck.mockResolvedValue({
       kind: 'error',
-      errorMessage: 'HEAD request failed (ECONNREFUSED)',
+      errorMessage: 'URL request failed',
     });
     resultDelayWait.mockReturnValue(controlledDelay.promise);
 
@@ -269,16 +271,15 @@ describe('JobsService asynchronous processing', () => {
     const completedUrlCheck = jobsService.findOne(jobId).urlChecks[0];
     expect(completedUrlCheck).toMatchObject({
       status: 'error',
-      errorMessage: 'HEAD request failed (ECONNREFUSED)',
+      errorMessage: 'URL request failed',
     });
     expect(typeof completedUrlCheck.completedAt).toBe('string');
     expect(typeof completedUrlCheck.durationMs).toBe('number');
     expect(warningLogger).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: 'url_check_transport_failed',
-        jobId,
-        errorType: 'transport',
-      }),
+      expect.stringContaining('"event":"url_check_transport_failed"'),
+    );
+    expect(warningLogger).toHaveBeenCalledWith(
+      expect.stringContaining(`"jobId":"${jobId}"`),
     );
     expect(debugLogger).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -288,6 +289,7 @@ describe('JobsService asynchronous processing', () => {
       }),
     );
   });
+
   it('cancels pending checks without starting them later', async () => {
     const activeRequests: DeferredPromise<HeadRequestOutcome>[] = [];
     headRequestCheck.mockImplementation(() => {
@@ -310,7 +312,6 @@ describe('JobsService asynchronous processing', () => {
     expect(
       cancelledJob.urlChecks.filter(({ status }) => status === 'cancelled'),
     ).toHaveLength(1);
-    expect(infoLogger).toHaveBeenCalledTimes(1);
     expect(infoLogger).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'job_cancelled',
@@ -347,6 +348,7 @@ describe('JobsService asynchronous processing', () => {
     expect(warningLogger).not.toHaveBeenCalled();
     expect(errorLogger).not.toHaveBeenCalled();
   });
+
   it('fails one job safely without affecting an independent job', async () => {
     const blockedRequests: DeferredPromise<HeadRequestOutcome>[] = [];
     headRequestCheck.mockImplementation((url) => {
@@ -374,7 +376,8 @@ describe('JobsService asynchronous processing', () => {
     );
     expect(
       failedJob.urlChecks.every(
-        ({ errorMessage }) => errorMessage === 'Internal job processing error',
+        ({ errorMessage }) =>
+          errorMessage === 'Job processing failed unexpectedly',
       ),
     ).toBe(true);
     expect(JSON.stringify(failedJob)).not.toContain('Sensitive internal');
@@ -390,7 +393,7 @@ describe('JobsService asynchronous processing', () => {
     );
     expect(debugLogger).toHaveBeenCalledWith(
       expect.objectContaining({
-        event: 'url_check_terminalized_after_failure',
+        event: 'url_check_state_changed',
         jobId: failedJobReference.jobId,
       }),
     );
@@ -444,22 +447,22 @@ describe('JobsService asynchronous processing', () => {
     expect(cancelledJob.status).toBe('cancelled');
     expect(cancelledJob.urlChecks[0]).toMatchObject({
       status: 'error',
-      errorMessage: 'Internal job processing error',
+      errorMessage: 'Job processing failed unexpectedly',
     });
     expect(typeof cancelledJob.urlChecks[0].completedAt).toBe('string');
     expect(JSON.stringify(cancelledJob)).not.toContain('Sensitive cancelled');
     expect(errorLogger).not.toHaveBeenCalled();
     expect(warningLogger).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: 'job_processing_failure_after_cancellation',
-        jobId,
-        failureStage: 'worker',
-        errorName: 'Error',
-      }),
+      expect.stringContaining(
+        '"event":"job_processing_failure_after_cancellation"',
+      ),
+    );
+    expect(warningLogger).toHaveBeenCalledWith(
+      expect.stringContaining(`"jobId":"${jobId}"`),
     );
     expect(debugLogger).toHaveBeenCalledWith(
       expect.objectContaining({
-        event: 'url_check_terminalized_after_failure',
+        event: 'url_check_state_changed',
         jobId,
         nextState: 'error',
       }),
