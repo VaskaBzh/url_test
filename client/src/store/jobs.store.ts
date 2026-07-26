@@ -87,12 +87,14 @@ export const useJobsStore = defineStore('jobs', () => {
   }
 
   async function loadDetails(requestedId: string): Promise<void> {
+    if (activeJobId.value !== requestedId) return;
     isLoadingDetails.value = true;
     try {
       const details = await getJob(requestedId);
       if (activeJobId.value !== requestedId) return;
       activeJob.value = details;
       await loadJobs();
+      if (activeJobId.value !== requestedId) return;
       if (!TERMINAL_STATUSES.includes(details.status)) schedulePoll(requestedId);
     } catch (error) {
       if (activeJobId.value === requestedId) errorMessage.value = toErrorMessage(error);

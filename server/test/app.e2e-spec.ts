@@ -20,6 +20,24 @@ describe('JobsController (e2e)', () => {
     return request(app.getHttpServer()).get('/jobs').expect(200).expect([]);
   });
 
+  it('rate limits repeated job creation attempts', async () => {
+    for (let requestNumber = 0; requestNumber < 5; requestNumber += 1) {
+      await request(app.getHttpServer())
+        .post('/jobs')
+        .send({ urls: [] })
+        .expect(400);
+    }
+
+    const throttledResponse = await request(app.getHttpServer())
+      .post('/jobs')
+      .send({ urls: [] })
+      .expect(429);
+
+    expect(throttledResponse.body as unknown).toMatchObject({
+      message: 'Too many requests. Please try again later.',
+    });
+  });
+
   afterEach(async () => {
     await app.close();
   });

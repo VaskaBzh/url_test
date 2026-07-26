@@ -34,3 +34,9 @@ export interface JobSummary {
   successfulUrls: number;
   errorUrls: number;
 }
+
+/** A DNS result that passed the public-network policy and can be pinned to a request. */
+export interface ResolvedPublicAddress {
+  address: string;
+  family: 4 | 6;
+}

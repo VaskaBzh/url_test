@@ -7,6 +7,7 @@ import {
   Param,
   Post,
 } from '@nestjs/common';
+import { minutes, Throttle } from '@nestjs/throttler';
 import type { CreateJobDto } from './dto/create-job.dto';
 import { JobsService } from './jobs.service';
 
@@ -17,6 +18,7 @@ export class JobsController {
 
   /** Creates a job and starts its background processing. */
   @Post()
+  @Throttle({ default: { ttl: minutes(1), limit: 5 } })
   create(@Body() createJobDto: CreateJobDto) {
     return this.jobsService.create(createJobDto.urls);
   }
