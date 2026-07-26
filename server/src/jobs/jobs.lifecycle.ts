@@ -157,13 +157,16 @@ export function cancelJob(job: Job): number {
  * completion timing only when its start timestamp is known.
  */
 export function failJob(job: Job, completedAt: string): boolean {
-  if (isTerminalJobStatus(job.status)) return false;
+  const wasCancelled = job.status === 'cancelled';
+  if (isTerminalJobStatus(job.status) && !wasCancelled) return false;
 
+  let didChangeState = false;
   for (const urlCheck of job.urlChecks) {
     if (isTerminalUrlCheckStatus(urlCheck.status)) continue;
 
     const previousStatus = urlCheck.status;
     transitionUrlCheckStatus(urlCheck, 'error');
+    didChangeState = true;
     urlCheck.errorMessage = INTERNAL_PROCESSOR_ERROR_MESSAGE;
     if (previousStatus === 'in_progress' && urlCheck.startedAt) {
       urlCheck.completedAt = completedAt;
@@ -181,6 +184,7 @@ export function failJob(job: Job, completedAt: string): boolean {
     }
   }
 
-  transitionJobStatus(job, 'failed');
-  return true;
+  if (wasCancelled) return didChangeState;
+
+  return transitionJobStatus(job, 'failed') || didChangeState;
 }
