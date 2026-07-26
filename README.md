@@ -37,6 +37,36 @@ make dev
 
 The Vue client is available at `http://localhost:5173`; the NestJS API listens on `http://localhost:3000`.
 
+## Client configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_API_URL` | `http://localhost:3000/api` | Overrides the URL used for job API requests. |
+| `VITE_LOG_LEVEL` | `error` | Controls client workflow logs: `error`, `warn`, or `silent`. |
+
+Workflow logs include only operation names, safe job identifiers, and error types. Submitted URLs and HTTP response bodies are not logged.
+
+## Tests
+
+Run the deterministic client workflow and accessibility tests:
+
+```bash
+npm --prefix client run test
+```
+
+Run the server end-to-end tests:
+
+```bash
+npm --prefix server run test:e2e -- --runInBand
+```
+
+Build both applications after tests pass:
+
+```bash
+npm --prefix client run build
+npm --prefix server run build
+```
+
 ## Docker
 
 ```bash

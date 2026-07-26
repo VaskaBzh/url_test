@@ -1,7 +1,6 @@
-import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
+import { defineConfig } from 'vitest/config';
+import vue from '@vitejs/plugin-vue';
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
   server: {
@@ -9,4 +8,9 @@ export default defineConfig({
       '/api': 'http://localhost:3000',
     },
   },
-})
+  test: {
+    environment: 'jsdom',
+    clearMocks: true,
+    restoreMocks: true,
+  },
+});
