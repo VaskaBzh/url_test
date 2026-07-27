@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue';
+﻿import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import { cancelJob, createJob, getJob, getJobs, isAbortError } from '../api/jobs.api';
 import type { JobDetails, JobStatus, JobSummary, UrlCheckStatus } from '../types';

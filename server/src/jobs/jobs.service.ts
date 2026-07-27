@@ -1,4 +1,10 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { HeadRequestService } from './head-request.service';
 import type {
@@ -10,11 +16,13 @@ import type {
 import {
   cancelJob,
   failJob,
+  isTerminalJobStatus,
   transitionJobStatus,
   transitionUrlCheckStatus,
 } from './jobs.lifecycle';
 import { ResultDelayService } from './result-delay.service';
 import type {
+  HeadRequestOutcome,
   Job,
   JobProcessingFailureStage,
   JobStatus,
@@ -22,7 +30,11 @@ import type {
   UrlCheckStatus,
 } from './jobs.types';
 
-const MAXIMUM_CONCURRENT_CHECKS = 5;
+const MAX_CONCURRENT_CHECKS_PER_JOB = 5;
+const MAX_GLOBAL_CONCURRENT_REQUESTS = 20;
+const MAX_PENDING_URL_CHECKS = 1_000;
+const MAX_STORED_JOBS = 100;
+const MAX_URLS_PER_JOB = 50;
 
 /**
  * Stores jobs in memory and executes URL checks in independent, bounded queues.
@@ -33,6 +45,8 @@ export class JobsService {
   private readonly jobs = new Map<string, Job>();
   private readonly jobsWithProcessingFailure = new Set<string>();
   private readonly logger = new Logger(JobsService.name);
+  private activeRequestCount = 0;
+  private readonly requestWaiters: Array<() => void> = [];
 
   constructor(
     private readonly headRequestService: HeadRequestService,
@@ -41,6 +55,10 @@ export class JobsService {
 
   /** Stores validated URLs and schedules their non-blocking processor. */
   create(urls: readonly string[]): CreateJobResponse {
+    this.ensurePerJobUrlCapacity(urls.length);
+    this.ensureJobCapacity();
+    this.ensureUrlCheckCapacity(urls.length);
+
     const job: Job = {
       id: randomUUID(),
       createdAt: new Date().toISOString(),
@@ -120,7 +138,7 @@ export class JobsService {
     this.applyJobStatus(job, 'in_progress');
     let nextUrlIndex = 0;
     const workerCount = Math.min(
-      MAXIMUM_CONCURRENT_CHECKS,
+      MAX_CONCURRENT_CHECKS_PER_JOB,
       job.urlChecks.length,
     );
 
@@ -192,22 +210,18 @@ export class JobsService {
     urlIndex: number,
   ): Promise<void> {
     if (job.status !== 'in_progress' || urlCheck.status !== 'pending') {
-      this.logger.debug({
-        event: 'url_check_skipped',
-        jobId: job.id,
-        urlIndex,
-        jobStatus: job.status,
-        urlStatus: urlCheck.status,
-      });
+      this.logSkippedUrlCheck(job, urlCheck, urlIndex);
       return;
     }
 
-    this.applyUrlCheckStatus(job, urlCheck, urlIndex, 'in_progress');
-    urlCheck.startedAt = new Date().toISOString();
-    const startedAtMilliseconds = Date.now();
+    const requestOutcome = await this.runBoundedHeadRequest(
+      job,
+      urlCheck,
+      urlIndex,
+    );
+    if (!requestOutcome) return;
 
     try {
-      const requestOutcome = await this.headRequestService.check(urlCheck.url);
       if (this.hasProcessingFailure(job)) {
         this.logger.debug({
           event: 'url_check_result_discarded',
@@ -241,7 +255,7 @@ export class JobsService {
             jobId: job.id,
             urlIndex,
             errorType:
-              requestOutcome.errorMessage === 'Request timed out'
+              requestOutcome.errorMessage === 'Request timed out.'
                 ? 'timeout'
                 : 'transport',
           }),
@@ -255,9 +269,47 @@ export class JobsService {
         state: urlCheck.status,
       });
     } finally {
-      urlCheck.completedAt ??= new Date().toISOString();
-      urlCheck.durationMs ??= Date.now() - startedAtMilliseconds;
+      this.completeUrlCheckTiming(urlCheck);
     }
+  }
+
+  private async runBoundedHeadRequest(
+    job: Job,
+    urlCheck: UrlCheck,
+    urlIndex: number,
+  ): Promise<HeadRequestOutcome | null> {
+    const releaseRequestPermit = await this.acquireRequestPermit();
+    try {
+      if (job.status !== 'in_progress' || urlCheck.status !== 'pending') {
+        this.logSkippedUrlCheck(job, urlCheck, urlIndex);
+        return null;
+      }
+
+      this.applyUrlCheckStatus(job, urlCheck, urlIndex, 'in_progress');
+      urlCheck.startedAt = new Date().toISOString();
+      return await this.headRequestService.check(urlCheck.url);
+    } finally {
+      releaseRequestPermit();
+    }
+  }
+
+  private acquireRequestPermit(): Promise<() => void> {
+    if (this.activeRequestCount < MAX_GLOBAL_CONCURRENT_REQUESTS) {
+      this.activeRequestCount += 1;
+      return Promise.resolve(() => this.releaseRequestPermit());
+    }
+
+    return new Promise((resolve) => {
+      this.requestWaiters.push(() => {
+        this.activeRequestCount += 1;
+        resolve(() => this.releaseRequestPermit());
+      });
+    });
+  }
+
+  private releaseRequestPermit(): void {
+    this.activeRequestCount -= 1;
+    this.requestWaiters.shift()?.();
   }
 
   private handleProcessorFailure(
@@ -366,6 +418,32 @@ export class JobsService {
     });
   }
 
+  private logSkippedUrlCheck(
+    job: Job,
+    urlCheck: UrlCheck,
+    urlIndex: number,
+  ): void {
+    this.logger.debug({
+      event: 'url_check_skipped',
+      jobId: job.id,
+      urlIndex,
+      jobStatus: job.status,
+      urlStatus: urlCheck.status,
+    });
+  }
+
+  private completeUrlCheckTiming(urlCheck: UrlCheck): void {
+    if (!urlCheck.startedAt) return;
+
+    urlCheck.completedAt ??= new Date().toISOString();
+    if (urlCheck.durationMs !== undefined) return;
+
+    const startedAtMilliseconds = Date.parse(urlCheck.startedAt);
+    if (Number.isFinite(startedAtMilliseconds)) {
+      urlCheck.durationMs = Math.max(0, Date.now() - startedAtMilliseconds);
+    }
+  }
+
   private getProcessingStopReason(
     job: Job,
   ): 'job_cancelled' | 'job_failed' | null {
@@ -376,6 +454,55 @@ export class JobsService {
 
   private hasProcessingFailure(job: Job): boolean {
     return this.jobsWithProcessingFailure.has(job.id);
+  }
+
+  private ensurePerJobUrlCapacity(urlCount: number): void {
+    if (urlCount === 0) {
+      throw new BadRequestException('urls must contain at least one item');
+    }
+    if (urlCount > MAX_URLS_PER_JOB) {
+      throw new BadRequestException(
+        `urls must contain at most ${MAX_URLS_PER_JOB} items`,
+      );
+    }
+  }
+
+  private ensureJobCapacity(): void {
+    const terminalJobs = [...this.jobs.values()]
+      .filter((job) => isTerminalJobStatus(job.status))
+      .sort((firstJob, secondJob) =>
+        firstJob.createdAt.localeCompare(secondJob.createdAt),
+      );
+
+    while (this.jobs.size >= MAX_STORED_JOBS && terminalJobs.length > 0) {
+      const oldestTerminalJob = terminalJobs.shift();
+      if (!oldestTerminalJob) continue;
+      this.jobs.delete(oldestTerminalJob.id);
+      this.jobsWithProcessingFailure.delete(oldestTerminalJob.id);
+    }
+
+    if (this.jobs.size >= MAX_STORED_JOBS) {
+      throw new ServiceUnavailableException(
+        'The service is at capacity. Please try again later.',
+      );
+    }
+  }
+
+  private ensureUrlCheckCapacity(requestedUrlCount: number): void {
+    const outstandingUrlCount = [...this.jobs.values()].reduce(
+      (totalCount, job) =>
+        totalCount +
+        job.urlChecks.filter(({ status }) =>
+          ['pending', 'in_progress'].includes(status),
+        ).length,
+      0,
+    );
+
+    if (outstandingUrlCount + requestedUrlCount > MAX_PENDING_URL_CHECKS) {
+      throw new ServiceUnavailableException(
+        'The service is at capacity. Please try again later.',
+      );
+    }
   }
 
   private getJobOrThrow(id: string): Job {

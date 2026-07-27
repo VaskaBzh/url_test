@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { ref } from 'vue';
 import type { JobFormEmits, JobFormProps } from './JobForm.types';
 
@@ -32,7 +32,7 @@ function submit(): void {
       {{ errorMessage }}
     </p>
     <button class="primary" type="submit" :disabled="isSubmitting">
-      {{ isSubmitting ? 'Starting checks…' : 'Run checks' }}
+      {{ isSubmitting ? 'Starting checks...' : 'Run checks' }}
     </button>
   </form>
 </template>

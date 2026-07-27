@@ -38,3 +38,9 @@ export interface Job {
   status: JobStatus;
   urlChecks: UrlCheck[];
 }
+
+/** A DNS result that passed the public-network policy and can be pinned to a request. */
+export interface ResolvedPublicAddress {
+  address: string;
+  family: 4 | 6;
+}

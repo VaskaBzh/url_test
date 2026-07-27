@@ -7,14 +7,15 @@ import {
   Param,
   Post,
 } from '@nestjs/common';
+import { minutes, Throttle } from '@nestjs/throttler';
 import type { CreateJobDto } from './dto/create-job.dto';
 import type {
   CreateJobResponse,
   JobDetailsResponse,
   JobSummaryResponse,
 } from './jobs.contracts';
-import { CreateJobValidationPipe } from './pipes/create-job-validation.pipe';
 import { JobsService } from './jobs.service';
+import { CreateJobValidationPipe } from './pipes/create-job-validation.pipe';
 
 /** HTTP endpoints for creating, inspecting, and cancelling URL-checking jobs. */
 @Controller('jobs')
@@ -23,6 +24,7 @@ export class JobsController {
 
   /** Creates a job and starts its background processing. */
   @Post()
+  @Throttle({ default: { ttl: minutes(1), limit: 5 } })
   create(
     @Body(CreateJobValidationPipe) createJobDto: CreateJobDto,
   ): CreateJobResponse {
