@@ -26,7 +26,7 @@ Lifecycle logs contain job ids, URL indexes, counts, state transitions, and erro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VITE_API_URL` | `http://localhost:3000/api` | Base URL used by the Vue API client |
+| `VITE_API_URL` | `/api` | Base URL used by the Vue API client |
 
 Set `VITE_API_URL` at client build time when the browser must call an API at another origin.
 

@@ -1,6 +1,6 @@
 import type { JobDetails, JobSummary } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL ?? '/api';
 
 /** Thin HTTP client for the job REST API. */
 async function request<T>(path: string, options?: RequestInit): Promise<T> {

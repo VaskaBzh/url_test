@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 
 export default defineConfig({
@@ -7,10 +7,5 @@ export default defineConfig({
     proxy: {
       '/api': 'http://localhost:3000',
     },
-  },
-  test: {
-    environment: 'jsdom',
-    clearMocks: true,
-    restoreMocks: true,
   },
 });
