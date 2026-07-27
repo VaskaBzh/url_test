@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import type { CreateJobDto } from '../dto/create-job.dto';
 
-const MAXIMUM_URL_COUNT = 100;
+const MAXIMUM_URL_COUNT = 50;
 const MAXIMUM_URL_LENGTH = 2_048;
 const SUPPORTED_PROTOCOLS = new Set(['http:', 'https:']);
 
@@ -110,6 +110,13 @@ export class CreateJobValidationPipe implements PipeTransform<
       this.rejectPayload(
         'url_protocol',
         `urls[${urlIndex}] must use http or https`,
+        { urlIndex, urlCount },
+      );
+    }
+    if (parsedUrl.username || parsedUrl.password) {
+      this.rejectPayload(
+        'url_credentials',
+        `urls[${urlIndex}] must not contain credentials`,
         { urlIndex, urlCount },
       );
     }

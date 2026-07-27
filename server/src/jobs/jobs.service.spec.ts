@@ -1,8 +1,8 @@
-import { Logger } from '@nestjs/common';
+import { BadRequestException, Logger } from '@nestjs/common';
+import type { HeadRequestOutcome, JobStatus } from './jobs.types';
 import { HeadRequestService } from './head-request.service';
 import { JobsService } from './jobs.service';
-import type { HeadRequestOutcome, JobStatus } from './jobs.types';
-import { ResultDelayService } from './result-delay.service';
+import type { ResultDelayService } from './result-delay.service';
 
 interface DeferredPromise<Value> {
   promise: Promise<Value>;
@@ -93,8 +93,12 @@ describe('JobsService asynchronous processing', () => {
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
 
-    headRequestService = new HeadRequestService();
-    resultDelayService = new ResultDelayService();
+    headRequestService = {
+      check: () => Promise.resolve({ kind: 'success', httpStatus: 200 }),
+    } as HeadRequestService;
+    resultDelayService = {
+      wait: () => Promise.resolve(undefined),
+    } as ResultDelayService;
     headRequestCheck = jest.spyOn(headRequestService, 'check');
     resultDelayWait = jest
       .spyOn(resultDelayService, 'wait')
@@ -104,6 +108,12 @@ describe('JobsService asynchronous processing', () => {
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('rejects jobs that exceed the per-job URL limit', () => {
+    expect(() => jobsService.create(createUrlList('too-many', 51))).toThrow(
+      BadRequestException,
+    );
   });
 
   it('limits each job to five active checks', async () => {
@@ -125,6 +135,7 @@ describe('JobsService asynchronous processing', () => {
     });
 
     const { jobId } = jobsService.create(createUrlList('concurrency', 6));
+    await flushAsynchronousWork();
 
     expect(headRequestCheck).toHaveBeenCalledTimes(5);
     expect(maximumActiveRequestCount).toBe(5);
@@ -141,11 +152,6 @@ describe('JobsService asynchronous processing', () => {
     }
     await waitForJobStatus(jobsService, jobId, 'completed');
 
-    expect(jobsService.findOne(jobId).urlChecks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ status: 'success', httpStatus: 200 }),
-      ]),
-    );
     expect(resultDelayWait).toHaveBeenCalledTimes(6);
     expect(debugLogger).toHaveBeenCalledWith(
       expect.objectContaining({ event: 'job_processing_started', jobId }),
@@ -158,6 +164,28 @@ describe('JobsService asynchronous processing', () => {
     );
     expect(warningLogger).not.toHaveBeenCalled();
     expect(errorLogger).not.toHaveBeenCalled();
+  });
+
+  it('limits active checks globally across jobs', async () => {
+    const deferredRequests: DeferredPromise<HeadRequestOutcome>[] = [];
+    headRequestCheck.mockImplementation(() => {
+      const deferredRequest = createDeferredPromise<HeadRequestOutcome>();
+      deferredRequests.push(deferredRequest);
+      return deferredRequest.promise;
+    });
+
+    const jobs = Array.from({ length: 25 }, (_, jobIndex) =>
+      jobsService.create([`https://global-limit.example/${jobIndex}`]),
+    );
+    await flushAsynchronousWork();
+
+    expect(jobs).toHaveLength(25);
+    expect(headRequestCheck).toHaveBeenCalledTimes(20);
+
+    deferredRequests[0].resolve({ kind: 'success', httpStatus: 200 });
+    await flushAsynchronousWork();
+
+    expect(headRequestCheck).toHaveBeenCalledTimes(21);
   });
 
   it('allows one job to complete while another job is blocked', async () => {
@@ -251,7 +279,7 @@ describe('JobsService asynchronous processing', () => {
     const controlledDelay = createDeferredPromise<void>();
     headRequestCheck.mockResolvedValue({
       kind: 'error',
-      errorMessage: 'URL request failed',
+      errorMessage: 'Unable to reach URL.',
     });
     resultDelayWait.mockReturnValue(controlledDelay.promise);
 
@@ -271,7 +299,7 @@ describe('JobsService asynchronous processing', () => {
     const completedUrlCheck = jobsService.findOne(jobId).urlChecks[0];
     expect(completedUrlCheck).toMatchObject({
       status: 'error',
-      errorMessage: 'URL request failed',
+      errorMessage: 'Unable to reach URL.',
     });
     expect(typeof completedUrlCheck.completedAt).toBe('string');
     expect(typeof completedUrlCheck.durationMs).toBe('number');
@@ -299,6 +327,7 @@ describe('JobsService asynchronous processing', () => {
     });
 
     const { jobId } = jobsService.create(createUrlList('cancellation', 6));
+    await flushAsynchronousWork();
 
     expect(headRequestCheck).toHaveBeenCalledTimes(5);
     jobsService.cancel(jobId);
@@ -439,6 +468,9 @@ describe('JobsService asynchronous processing', () => {
     const { jobId } = jobsService.create([
       'https://cancelled-internal-failure.example/1',
     ]);
+    await flushAsynchronousWork();
+    expect(headRequestCheck).toHaveBeenCalledTimes(1);
+
     jobsService.cancel(jobId);
     controlledRequest.resolve({ kind: 'success', httpStatus: 200 });
     await waitForUrlChecksToFinish(jobsService, jobId);

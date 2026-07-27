@@ -7,6 +7,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { configureApplication } from '../src/app.config';
 import { AppModule } from '../src/app.module';
+import { UrlSafetyService } from '../src/jobs/url-safety.service';
 
 interface CreateJobResponseBody {
   readonly jobId: string;
@@ -55,11 +56,39 @@ describe('Jobs API (e2e)', () => {
   beforeEach(async () => {
     const testingModule = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(UrlSafetyService)
+      .useValue({
+        isPublicAddress: () => true,
+        resolvePublicAddress: (parsedUrl: URL) =>
+          Promise.resolve({
+            address: parsedUrl.hostname,
+            family: parsedUrl.hostname.includes(':') ? 6 : 4,
+          }),
+      })
+      .compile();
     application = testingModule.createNestApplication({ logger: false });
     configureApplication(application);
     await application.init();
     jest.spyOn(Math, 'random').mockReturnValue(0);
+  });
+
+  it('rate limits repeated job creation attempts', async () => {
+    for (let requestNumber = 0; requestNumber < 5; requestNumber += 1) {
+      await request(application.getHttpServer())
+        .post('/api/jobs')
+        .send({ urls: [] })
+        .expect(400);
+    }
+
+    const throttledResponse = await request(application.getHttpServer())
+      .post('/api/jobs')
+      .send({ urls: [] })
+      .expect(429);
+
+    expect(throttledResponse.body as unknown).toMatchObject({
+      message: 'Too many requests. Please try again later.',
+    });
   });
 
   afterEach(async () => {
@@ -194,7 +223,7 @@ describe('Jobs API (e2e)', () => {
     const jobDetails = await waitForJobStatus(application, jobId, 'completed');
     expect(jobDetails.urlChecks).toHaveLength(1);
     expect(jobDetails.urlChecks[0]).toMatchObject({
-      errorMessage: 'URL request failed',
+      errorMessage: 'Unable to reach URL.',
       status: 'error',
     });
     const warningOutput = warningLogger.mock.calls.flat().join(' ');

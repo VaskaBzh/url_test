@@ -49,6 +49,10 @@ describe('CreateJobValidationPipe', () => {
       expectedMessage: 'urls[0] must use http or https',
       payload: { urls: ['ftp://localhost/file'] },
     },
+    {
+      expectedMessage: 'urls[0] must not contain credentials',
+      payload: { urls: ['https://user:secret@example.com'] },
+    },
   ])(
     'returns a stable bad-request response for $expectedMessage',
     ({ expectedMessage, payload }) => {
@@ -57,16 +61,16 @@ describe('CreateJobValidationPipe', () => {
     },
   );
 
-  it('rejects a payload with more than one hundred URLs', () => {
+  it('rejects a payload with more than fifty URLs', () => {
     const urls = Array.from(
-      { length: 101 },
+      { length: 51 },
       (_, urlIndex) => `http://localhost/${urlIndex}`,
     );
 
     expectBadRequest(
       validationPipe,
       { urls },
-      'urls must contain at most 100 items',
+      'urls must contain at most 50 items',
     );
   });
 

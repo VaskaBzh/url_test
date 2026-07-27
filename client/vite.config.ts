@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+﻿import { defineConfig } from 'vitest/config';
 import vue from '@vitejs/plugin-vue';
 
 export default defineConfig({
@@ -9,8 +9,9 @@ export default defineConfig({
     },
   },
   test: {
-    environment: 'jsdom',
     clearMocks: true,
+    environment: 'jsdom',
+    reporters: ['verbose'],
     restoreMocks: true,
   },
 });
