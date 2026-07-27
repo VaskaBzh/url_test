@@ -1,55 +1,73 @@
 # Async URL Checker
 
-NestJS API and Vue 3 client for asynchronous HEAD checks of URL lists. Job data lives in memory, so it is reset when the API restarts.
+Небольшое приложение для асинхронной проверки списка URL через HTTP `HEAD`.
 
-## Stack
+Проект состоит из двух частей:
 
-- NestJS + TypeScript API
-- Vue 3 + TypeScript + Pinia client
-- Docker Compose for containerized execution
+- `server` - NestJS API;
+- `client` - Vue 3 + Pinia интерфейс.
 
-## Run locally
+Проверки выполняются в памяти процесса. После перезапуска сервера или контейнера история задач очищается.
 
-Use two terminals:
+## Запуск через Make
 
-```bash
-cd server
-npm install
-npm run start:dev
-```
-
-```bash
-cd client
-npm install
-npm run dev
-```
-
-Open `http://localhost:5173`. The Vite development server proxies `/api` requests to NestJS on port 3000.
-
-### Makefile
-
-If `make` is available, run both development servers with:
+Понадобятся Node.js 22+, npm и `make`.
 
 ```bash
 make install
 make dev
 ```
 
-The Vue client is available at `http://localhost:5173`; the NestJS API listens on `http://localhost:3000`.
+После запуска:
 
-## Docker
+- веб-интерфейс: `http://localhost:5173`;
+- API: `http://localhost:3000/api`.
+
+Полезные команды:
+
+```bash
+make server      # запустить только API
+make client      # запустить только клиент
+make build       # собрать клиент и сервер
+```
+
+## Запуск через Docker
+
+Понадобятся Docker и Docker Compose.
 
 ```bash
 docker compose up --build
 ```
 
-The API listens on port 3000. For the production image, serve the generated `client/dist` directory from a web server or reverse proxy.
+После сборки приложение будет доступно на `http://localhost:3000`.
+
+Остановить контейнеры можно так:
+
+```bash
+make docker-down
+```
+
+или напрямую:
+
+```bash
+docker compose down
+```
 
 ## API
 
-- `POST /api/jobs` — `{ "urls": ["https://example.com"] }`
-- `GET /api/jobs` — job summaries and aggregate statistics
-- `GET /api/jobs/:id` — URL-level status, response code, errors, and timing
-- `DELETE /api/jobs/:id` — cancels pending URLs in the job
+Основные эндпоинты:
 
-Each job uses at most five simultaneous HEAD requests. Completed HTTP requests wait for a random 0–10 second delay before their results are saved.
+- `POST /api/jobs` - создать задачу проверки URL;
+- `GET /api/jobs` - получить список задач;
+- `GET /api/jobs/:id` - получить детали задачи;
+- `DELETE /api/jobs/:id` - отменить задачу.
+
+Пример:
+
+```bash
+curl -X POST http://localhost:3000/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"urls":["https://example.com","https://openai.com"]}'
+```
+
+Подробности есть в [docs/api.md](docs/api.md) и [docs/configuration.md](docs/configuration.md).

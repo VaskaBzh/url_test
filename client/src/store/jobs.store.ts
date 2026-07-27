@@ -1,15 +1,16 @@
-import { computed, ref } from 'vue';
+﻿import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
-import { cancelJob, createJob, getJob, getJobs } from '../api/jobs.api';
+import { cancelJob, createJob, getJob, getJobs, isAbortError } from '../api/jobs.api';
 import type { JobDetails, JobStatus, JobSummary, UrlCheckStatus } from '../types';
+import { logWorkflowError } from '../utils/workflow.logger';
 
-const POLL_INTERVAL_MS = 1_500;
+const POLL_INTERVAL_MILLISECONDS = 1_500;
 const TERMINAL_STATUSES: JobStatus[] = ['completed', 'cancelled', 'failed'];
 const TERMINAL_URL_STATUSES: UrlCheckStatus[] = ['success', 'error', 'cancelled'];
 
 /**
- * Owns the job list and active job state. Each poll checks its id before committing
- * a response, so a late request can never overwrite a newly selected job.
+ * Owns the job list and active job state. Request generations prevent obsolete
+ * asynchronous work from mutating a newer user selection.
  */
 export const useJobsStore = defineStore('jobs', () => {
   const jobs = ref<JobSummary[]>([]);
@@ -18,97 +19,228 @@ export const useJobsStore = defineStore('jobs', () => {
   const isLoadingJobs = ref(false);
   const isLoadingDetails = ref(false);
   const isSubmitting = ref(false);
-  const isCancelling = ref(false);
-  const errorMessage = ref<string | null>(null);
+  const cancellingJobId = ref<string | null>(null);
+  const listErrorMessage = ref<string | null>(null);
+  const detailsErrorMessage = ref<string | null>(null);
+  const submissionErrorMessage = ref<string | null>(null);
+  const cancellationErrorMessage = ref<string | null>(null);
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let selectionGeneration = 0;
+  let detailRequestGeneration = 0;
+  let detailAbortController: AbortController | null = null;
+  let listRequestGeneration = 0;
+  let listAbortController: AbortController | null = null;
 
-  const completedUrlCount = computed(() => activeJob.value?.urlChecks.filter(({ status }) => TERMINAL_URL_STATUSES.includes(status)).length ?? 0);
-  const canCancelActiveJob = computed(() => activeJob.value !== null && !TERMINAL_STATUSES.includes(activeJob.value.status));
+  const completedUrlCount = computed(
+    () => activeJob.value?.urlChecks.filter(({ status }) => TERMINAL_URL_STATUSES.includes(status)).length ?? 0,
+  );
+  const isCancelling = computed(
+    () => activeJobId.value !== null && cancellingJobId.value === activeJobId.value,
+  );
+  const canCancelActiveJob = computed(
+    () => activeJob.value !== null
+      && cancellingJobId.value === null
+      && !TERMINAL_STATUSES.includes(activeJob.value.status),
+  );
+  const errorMessage = computed(
+    () => submissionErrorMessage.value
+      ?? cancellationErrorMessage.value
+      ?? detailsErrorMessage.value
+      ?? listErrorMessage.value,
+  );
 
   /** Fetches the latest job summaries without changing the current selection. */
   async function loadJobs(): Promise<void> {
+    const requestGeneration = startListRequest();
+    const abortController = listAbortController;
     isLoadingJobs.value = true;
+    listErrorMessage.value = null;
+
     try {
-      jobs.value = await getJobs();
+      const summaries = await getJobs(abortController?.signal);
+      if (!isCurrentListRequest(requestGeneration)) return;
+      jobs.value = summaries;
     } catch (error) {
-      errorMessage.value = toErrorMessage(error);
+      if (isAbortError(error) || !isCurrentListRequest(requestGeneration)) return;
+      listErrorMessage.value = toErrorMessage(error);
+      logWorkflowError('loadJobs', error);
     } finally {
-      isLoadingJobs.value = false;
+      if (isCurrentListRequest(requestGeneration)) {
+        isLoadingJobs.value = false;
+        listAbortController = null;
+      }
     }
   }
 
   /** Selects a job and starts a polling cycle for it if it remains active. */
-  async function selectJob(id: string): Promise<void> {
+  async function selectJob(jobId: string): Promise<void> {
     stopPolling();
-    activeJobId.value = id;
+    activeJobId.value = jobId;
     activeJob.value = null;
-    await loadDetails(id);
+    detailsErrorMessage.value = null;
+    cancellationErrorMessage.value = null;
+    await loadDetails(jobId);
   }
 
-  /** Submits valid textarea content, then makes the created job active. */
+  /** Submits valid textarea content without overriding a later manual selection. */
   async function submitJob(textareaValue: string): Promise<boolean> {
+    if (isSubmitting.value) return false;
+
     const urls = textareaValue.split(/\r?\n/).map((url) => url.trim()).filter(Boolean);
     if (!urls.length) {
-      errorMessage.value = 'Enter at least one URL.';
+      submissionErrorMessage.value = 'Enter at least one URL.';
       return false;
     }
+
+    const selectionGenerationAtSubmission = selectionGeneration;
     isSubmitting.value = true;
-    errorMessage.value = null;
+    submissionErrorMessage.value = null;
+
     try {
       const { jobId } = await createJob(urls);
-      await Promise.all([loadJobs(), selectJob(jobId)]);
+      if (selectionGeneration === selectionGenerationAtSubmission) {
+        await selectJob(jobId);
+      } else {
+        await loadJobs();
+      }
       return true;
     } catch (error) {
-      errorMessage.value = toErrorMessage(error);
+      submissionErrorMessage.value = toErrorMessage(error);
+      logWorkflowError('submitJob', error);
       return false;
     } finally {
       isSubmitting.value = false;
     }
   }
 
-  /** Sends cancellation for the active job and refreshes its server state. */
+  /** Cancels the job captured at invocation without mutating a later selection. */
   async function cancelActiveJob(): Promise<void> {
-    if (!activeJobId.value) return;
-    isCancelling.value = true;
+    const jobId = activeJobId.value;
+    if (!jobId || cancellingJobId.value !== null) return;
+
+    const selectionGenerationAtCancellation = selectionGeneration;
+    cancellingJobId.value = jobId;
+    cancellationErrorMessage.value = null;
+
     try {
-      await cancelJob(activeJobId.value);
-      await Promise.all([loadJobs(), loadDetails(activeJobId.value)]);
+      await cancelJob(jobId);
+      await loadJobs();
+      if (isSelectionCurrent(jobId, selectionGenerationAtCancellation)) {
+        await loadDetails(jobId);
+      }
     } catch (error) {
-      errorMessage.value = toErrorMessage(error);
+      if (!isSelectionCurrent(jobId, selectionGenerationAtCancellation)) return;
+      cancellationErrorMessage.value = toErrorMessage(error);
+      logWorkflowError('cancelActiveJob', error, jobId);
     } finally {
-      isCancelling.value = false;
+      if (cancellingJobId.value === jobId) {
+        cancellingJobId.value = null;
+      }
     }
   }
 
-  /** Clears a scheduled poll; call before any active job transition. */
+  /** Invalidates scheduled and in-flight detail work for the active selection. */
   function stopPolling(): void {
-    if (pollTimer) clearTimeout(pollTimer);
-    pollTimer = null;
+    clearPollTimer();
+    selectionGeneration += 1;
+    detailRequestGeneration += 1;
+    detailAbortController?.abort();
+    detailAbortController = null;
+    isLoadingDetails.value = false;
   }
 
-  async function loadDetails(requestedId: string): Promise<void> {
+  async function loadDetails(requestedJobId: string): Promise<void> {
+    const requestGeneration = startDetailRequest();
+    const abortController = detailAbortController;
     isLoadingDetails.value = true;
+    detailsErrorMessage.value = null;
+
     try {
-      const details = await getJob(requestedId);
-      if (activeJobId.value !== requestedId) return;
+      const details = await getJob(requestedJobId, abortController?.signal);
+      if (!isCurrentDetailRequest(requestedJobId, requestGeneration)) return;
+
       activeJob.value = details;
       await loadJobs();
-      if (!TERMINAL_STATUSES.includes(details.status)) schedulePoll(requestedId);
+
+      if (!isCurrentDetailRequest(requestedJobId, requestGeneration)) return;
+      if (!TERMINAL_STATUSES.includes(details.status)) {
+        schedulePoll(requestedJobId, requestGeneration);
+      }
     } catch (error) {
-      if (activeJobId.value === requestedId) errorMessage.value = toErrorMessage(error);
+      if (isAbortError(error) || !isCurrentDetailRequest(requestedJobId, requestGeneration)) return;
+      detailsErrorMessage.value = toErrorMessage(error);
+      logWorkflowError('loadDetails', error, requestedJobId);
     } finally {
-      if (activeJobId.value === requestedId) isLoadingDetails.value = false;
+      if (isCurrentDetailRequest(requestedJobId, requestGeneration)) {
+        isLoadingDetails.value = false;
+        detailAbortController = null;
+      }
     }
   }
 
-  function schedulePoll(id: string): void {
-    stopPolling();
-    pollTimer = setTimeout(() => void loadDetails(id), POLL_INTERVAL_MS);
+  function startDetailRequest(): number {
+    clearPollTimer();
+    detailAbortController?.abort();
+    detailAbortController = new AbortController();
+    detailRequestGeneration += 1;
+    return detailRequestGeneration;
+  }
+
+  function startListRequest(): number {
+    listAbortController?.abort();
+    listAbortController = new AbortController();
+    listRequestGeneration += 1;
+    return listRequestGeneration;
+  }
+
+  function isCurrentDetailRequest(requestedJobId: string, requestGeneration: number): boolean {
+    return activeJobId.value === requestedJobId && detailRequestGeneration === requestGeneration;
+  }
+
+  function isCurrentListRequest(requestGeneration: number): boolean {
+    return listRequestGeneration === requestGeneration;
+  }
+
+  function isSelectionCurrent(jobId: string, requestSelectionGeneration: number): boolean {
+    return activeJobId.value === jobId && selectionGeneration === requestSelectionGeneration;
+  }
+
+  function schedulePoll(requestedJobId: string, requestGeneration: number): void {
+    clearPollTimer();
+    pollTimer = setTimeout(() => {
+      if (!isCurrentDetailRequest(requestedJobId, requestGeneration)) return;
+      void loadDetails(requestedJobId);
+    }, POLL_INTERVAL_MILLISECONDS);
+  }
+
+  function clearPollTimer(): void {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
   }
 
   function toErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : 'Unable to complete the request.';
   }
 
-  return { jobs, activeJobId, activeJob, isLoadingJobs, isLoadingDetails, isSubmitting, isCancelling, errorMessage, completedUrlCount, canCancelActiveJob, loadJobs, selectJob, submitJob, cancelActiveJob, stopPolling };
+  return {
+    jobs,
+    activeJobId,
+    activeJob,
+    isLoadingJobs,
+    isLoadingDetails,
+    isSubmitting,
+    isCancelling,
+    listErrorMessage,
+    detailsErrorMessage,
+    submissionErrorMessage,
+    cancellationErrorMessage,
+    errorMessage,
+    completedUrlCount,
+    canCancelActiveJob,
+    loadJobs,
+    selectJob,
+    submitJob,
+    cancelActiveJob,
+    stopPolling,
+  };
 });

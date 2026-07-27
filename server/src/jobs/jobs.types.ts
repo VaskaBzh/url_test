@@ -6,6 +6,20 @@ export type JobStatus =
 export type UrlCheckStatus =
   'pending' | 'in_progress' | 'success' | 'error' | 'cancelled';
 
+/** Result returned by the HTTP boundary without exposing transport exceptions. */
+export type HeadRequestOutcome =
+  | {
+      kind: 'success';
+      httpStatus: number;
+    }
+  | {
+      kind: 'error';
+      errorMessage: string;
+    };
+
+/** Internal stage that detected a job-level processing failure. */
+export type JobProcessingFailureStage = 'worker' | 'detached_boundary';
+
 /** Mutable in-memory representation of an individual URL check. */
 export interface UrlCheck {
   url: string;
@@ -25,12 +39,8 @@ export interface Job {
   urlChecks: UrlCheck[];
 }
 
-/** Compact job shape returned by the job list endpoint. */
-export interface JobSummary {
-  id: string;
-  createdAt: string;
-  status: JobStatus;
-  totalUrls: number;
-  successfulUrls: number;
-  errorUrls: number;
+/** A DNS result that passed the public-network policy and can be pinned to a request. */
+export interface ResolvedPublicAddress {
+  address: string;
+  family: 4 | 6;
 }

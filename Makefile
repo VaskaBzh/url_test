@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev server client build test docker-up docker-down
+.PHONY: help install dev server client build docker-up docker-down
 
 ## Display the available commands.
 help:
@@ -10,7 +10,6 @@ help:
 	@echo "  make server      Start only the NestJS development server"
 	@echo "  make client      Start only the Vue development server"
 	@echo "  make build       Build both applications"
-	@echo "  make test        Run the server e2e tests"
 	@echo "  make docker-up   Build and start Docker Compose"
 	@echo "  make docker-down Stop Docker Compose"
 
@@ -38,10 +37,6 @@ client:
 build:
 	npm --prefix server run build
 	npm --prefix client run build
-
-## Run the API end-to-end test suite.
-test:
-	npm --prefix server run test:e2e -- --runInBand
 
 ## Build and run the Docker Compose environment.
 docker-up:

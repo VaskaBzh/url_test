@@ -1,5 +1,46 @@
-# Vue 3 + TypeScript + Vite
+# Async URL Checker Client
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+Vue 3, TypeScript, and Pinia frontend for creating URL-check jobs and following their asynchronous progress.
 
-Learn more about the recommended Project Setup and IDE Support in the [Vue Docs TypeScript Guide](https://vuejs.org/guide/typescript/overview.html#project-setup).
+## Requirements
+
+- Node.js `^20.19.0`, `^22.12.0`, or a newer supported release
+- npm
+
+## Install
+
+```bash
+npm ci
+```
+
+## Development
+
+```bash
+npm run dev
+```
+
+The Vite development server starts at `http://localhost:5173` and proxies `/api` requests to the backend on port 3000.
+
+## Regression tests
+
+Run the deterministic frontend suite once:
+
+```bash
+npm test
+```
+
+Run the suite in watch mode while developing:
+
+```bash
+npm run test:watch
+```
+
+The suite covers Pinia loading, submission, cancellation, polling, stale-response isolation, and the public `JobForm` submit contract. API calls, timers, and asynchronous races are controlled by mocks, so the backend and network are not required.
+
+## Production build
+
+```bash
+npm run build
+```
+
+The build command performs Vue and TypeScript checks before creating `dist/`.
