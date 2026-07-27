@@ -39,16 +39,6 @@ export interface Job {
   urlChecks: UrlCheck[];
 }
 
-/** Compact job shape returned by the job list endpoint. */
-export interface JobSummary {
-  id: string;
-  createdAt: string;
-  status: JobStatus;
-  totalUrls: number;
-  successfulUrls: number;
-  errorUrls: number;
-}
-
 /** A DNS result that passed the public-network policy and can be pinned to a request. */
 export interface ResolvedPublicAddress {
   address: string;

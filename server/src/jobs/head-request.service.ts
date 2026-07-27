@@ -1,4 +1,4 @@
-﻿import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { request, type RequestOptions } from 'node:http';
 import { request as secureRequest } from 'node:https';
 import type { LookupFunction } from 'node:net';
@@ -36,6 +36,7 @@ export class HeadRequestService {
     const requestContext = {
       event: 'head_request',
       hostname: parsedUrl.hostname,
+      protocol: parsedUrl.protocol.replace(':', ''),
     };
 
     this.logger.debug({ ...requestContext, state: 'started' });

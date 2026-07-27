@@ -1,5 +1,5 @@
-﻿import { BadRequestException, Logger } from '@nestjs/common';
-import type { HeadRequestOutcome } from './jobs.types';
+import { BadRequestException, Logger } from '@nestjs/common';
+import type { HeadRequestOutcome, JobStatus } from './jobs.types';
 import { HeadRequestService } from './head-request.service';
 import { JobsService } from './jobs.service';
 import type { ResultDelayService } from './result-delay.service';
@@ -39,8 +39,7 @@ async function flushAsynchronousWork(): Promise<void> {
 async function waitForJobStatus(
   jobsService: JobsService,
   jobId: string,
-  expectedStatus:
-    'completed' | 'cancelled' | 'failed' | 'in_progress' | 'pending',
+  expectedStatus: JobStatus,
 ): Promise<void> {
   for (let attemptNumber = 0; attemptNumber < 20; attemptNumber += 1) {
     if (jobsService.findOne(jobId).status === expectedStatus) return;
@@ -52,18 +51,41 @@ async function waitForJobStatus(
   );
 }
 
-describe('JobsService merged processing boundaries', () => {
+async function waitForUrlChecksToFinish(
+  jobsService: JobsService,
+  jobId: string,
+): Promise<void> {
+  for (let attemptNumber = 0; attemptNumber < 20; attemptNumber += 1) {
+    const hasNonterminalCheck = jobsService
+      .findOne(jobId)
+      .urlChecks.some(({ status }) =>
+        ['pending', 'in_progress'].includes(status),
+      );
+    if (!hasNonterminalCheck) return;
+    await flushAsynchronousWork();
+  }
+
+  throw new Error(`Job ${jobId} still has nonterminal URL checks`);
+}
+
+describe('JobsService asynchronous processing', () => {
   let jobsService: JobsService;
   let headRequestService: HeadRequestService;
   let resultDelayService: ResultDelayService;
   let headRequestCheck: jest.SpiedFunction<HeadRequestService['check']>;
   let resultDelayWait: jest.SpiedFunction<ResultDelayService['wait']>;
+  let debugLogger: jest.SpyInstance;
+  let infoLogger: jest.SpyInstance;
   let warningLogger: jest.SpyInstance;
   let errorLogger: jest.SpyInstance;
 
   beforeEach(() => {
-    jest.spyOn(Logger.prototype, 'debug').mockImplementation(() => undefined);
-    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    debugLogger = jest
+      .spyOn(Logger.prototype, 'debug')
+      .mockImplementation(() => undefined);
+    infoLogger = jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined);
     warningLogger = jest
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
@@ -89,12 +111,9 @@ describe('JobsService merged processing boundaries', () => {
   });
 
   it('rejects jobs that exceed the per-job URL limit', () => {
-    const urls = Array.from(
-      { length: 51 },
-      (_, index) => `https://example-${index}.com`,
+    expect(() => jobsService.create(createUrlList('too-many', 51))).toThrow(
+      BadRequestException,
     );
-
-    expect(() => jobsService.create(urls)).toThrow(BadRequestException);
   });
 
   it('limits each job to five active checks', async () => {
@@ -127,6 +146,46 @@ describe('JobsService merged processing boundaries', () => {
 
     expect(headRequestCheck).toHaveBeenCalledTimes(6);
     expect(maximumActiveRequestCount).toBe(5);
+
+    for (const deferredRequest of deferredRequests.slice(1)) {
+      deferredRequest.resolve({ kind: 'success', httpStatus: 200 });
+    }
+    await waitForJobStatus(jobsService, jobId, 'completed');
+
+    expect(resultDelayWait).toHaveBeenCalledTimes(6);
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'job_processing_started', jobId }),
+    );
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'job_worker_check_started', jobId }),
+    );
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'job_processing_completed', jobId }),
+    );
+    expect(warningLogger).not.toHaveBeenCalled();
+    expect(errorLogger).not.toHaveBeenCalled();
+  });
+
+  it('limits active checks globally across jobs', async () => {
+    const deferredRequests: DeferredPromise<HeadRequestOutcome>[] = [];
+    headRequestCheck.mockImplementation(() => {
+      const deferredRequest = createDeferredPromise<HeadRequestOutcome>();
+      deferredRequests.push(deferredRequest);
+      return deferredRequest.promise;
+    });
+
+    const jobs = Array.from({ length: 25 }, (_, jobIndex) =>
+      jobsService.create([`https://global-limit.example/${jobIndex}`]),
+    );
+    await flushAsynchronousWork();
+
+    expect(jobs).toHaveLength(25);
+    expect(headRequestCheck).toHaveBeenCalledTimes(20);
+
+    deferredRequests[0].resolve({ kind: 'success', httpStatus: 200 });
+    await flushAsynchronousWork();
+
+    expect(headRequestCheck).toHaveBeenCalledTimes(21);
   });
 
   it('allows one job to complete while another job is blocked', async () => {
@@ -156,6 +215,64 @@ describe('JobsService merged processing boundaries', () => {
 
     blockedRequest.resolve({ kind: 'success', httpStatus: 200 });
     await waitForJobStatus(jobsService, blockedJob.jobId, 'completed');
+
+    const jobSummaries = jobsService.findAll();
+    expect(jobSummaries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: blockedJob.jobId,
+          totalUrls: 1,
+          successfulUrls: 1,
+          errorUrls: 0,
+        }),
+        expect.objectContaining({
+          id: independentJob.jobId,
+          totalUrls: 1,
+          successfulUrls: 1,
+          errorUrls: 0,
+        }),
+      ]),
+    );
+    expect(warningLogger).not.toHaveBeenCalled();
+    expect(errorLogger).not.toHaveBeenCalled();
+  });
+
+  it('publishes a successful result only after the delay completes', async () => {
+    const controlledDelay = createDeferredPromise<void>();
+    headRequestCheck.mockResolvedValue({ kind: 'success', httpStatus: 201 });
+    resultDelayWait.mockReturnValue(controlledDelay.promise);
+
+    const { jobId } = jobsService.create(['https://delayed-success.example/1']);
+    await flushAsynchronousWork();
+
+    const delayedJob = jobsService.findOne(jobId);
+    expect(delayedJob.status).toBe('in_progress');
+    expect(delayedJob.urlChecks[0]).toMatchObject({ status: 'in_progress' });
+    expect(delayedJob.urlChecks[0].httpStatus).toBeUndefined();
+    expect(delayedJob.urlChecks[0].errorMessage).toBeUndefined();
+    expect(delayedJob.urlChecks[0].completedAt).toBeUndefined();
+    expect(delayedJob.urlChecks[0].durationMs).toBeUndefined();
+    expect(debugLogger).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'url_check_result_published', jobId }),
+    );
+
+    controlledDelay.resolve(undefined);
+    await waitForJobStatus(jobsService, jobId, 'completed');
+
+    const completedUrlCheck = jobsService.findOne(jobId).urlChecks[0];
+    expect(completedUrlCheck).toMatchObject({
+      status: 'success',
+      httpStatus: 201,
+    });
+    expect(typeof completedUrlCheck.completedAt).toBe('string');
+    expect(typeof completedUrlCheck.durationMs).toBe('number');
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'url_check_result_published',
+        jobId,
+        state: 'success',
+      }),
+    );
   });
 
   it('publishes a transport error only after the delay completes', async () => {
@@ -172,21 +289,31 @@ describe('JobsService merged processing boundaries', () => {
     const delayedJob = jobsService.findOne(jobId);
     expect(delayedJob.status).toBe('in_progress');
     expect(delayedJob.urlChecks[0]).toMatchObject({ status: 'in_progress' });
+    expect(delayedJob.urlChecks[0].httpStatus).toBeUndefined();
     expect(delayedJob.urlChecks[0].errorMessage).toBeUndefined();
     expect(warningLogger).not.toHaveBeenCalled();
 
     controlledDelay.resolve(undefined);
     await waitForJobStatus(jobsService, jobId, 'completed');
 
-    expect(jobsService.findOne(jobId).urlChecks[0]).toMatchObject({
+    const completedUrlCheck = jobsService.findOne(jobId).urlChecks[0];
+    expect(completedUrlCheck).toMatchObject({
       status: 'error',
       errorMessage: 'Unable to reach URL.',
     });
+    expect(typeof completedUrlCheck.completedAt).toBe('string');
+    expect(typeof completedUrlCheck.durationMs).toBe('number');
     expect(warningLogger).toHaveBeenCalledWith(
+      expect.stringContaining('"event":"url_check_transport_failed"'),
+    );
+    expect(warningLogger).toHaveBeenCalledWith(
+      expect.stringContaining(`"jobId":"${jobId}"`),
+    );
+    expect(debugLogger).toHaveBeenCalledWith(
       expect.objectContaining({
-        event: 'url_check_transport_failed',
+        event: 'url_check_result_published',
         jobId,
-        errorType: 'transport',
+        state: 'error',
       }),
     );
   });
@@ -204,44 +331,86 @@ describe('JobsService merged processing boundaries', () => {
 
     expect(headRequestCheck).toHaveBeenCalledTimes(5);
     jobsService.cancel(jobId);
+    jobsService.cancel(jobId);
 
     const cancelledJob = jobsService.findOne(jobId);
     expect(cancelledJob.status).toBe('cancelled');
     expect(
+      cancelledJob.urlChecks.filter(({ status }) => status === 'in_progress'),
+    ).toHaveLength(5);
+    expect(
       cancelledJob.urlChecks.filter(({ status }) => status === 'cancelled'),
     ).toHaveLength(1);
+    expect(infoLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'job_cancelled',
+        jobId,
+        cancelledUrlCount: 1,
+      }),
+    );
 
     for (const activeRequest of activeRequests) {
       activeRequest.resolve({ kind: 'success', httpStatus: 200 });
     }
-    await waitForJobStatus(jobsService, jobId, 'cancelled');
+    await waitForUrlChecksToFinish(jobsService, jobId);
 
+    const finishedCancelledJob = jobsService.findOne(jobId);
+    expect(finishedCancelledJob.status).toBe('cancelled');
     expect(headRequestCheck).toHaveBeenCalledTimes(5);
+    expect(
+      finishedCancelledJob.urlChecks.filter(
+        ({ status }) => status === 'success',
+      ),
+    ).toHaveLength(5);
+    expect(
+      finishedCancelledJob.urlChecks.filter(
+        ({ status }) => status === 'cancelled',
+      ),
+    ).toHaveLength(1);
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'job_worker_stopped',
+        jobId,
+        reason: 'job_cancelled',
+      }),
+    );
+    expect(warningLogger).not.toHaveBeenCalled();
+    expect(errorLogger).not.toHaveBeenCalled();
   });
 
-  it('fails one job safely when the internal delay layer breaks', async () => {
-    headRequestCheck.mockResolvedValue({ kind: 'success', httpStatus: 200 });
+  it('fails one job safely without affecting an independent job', async () => {
+    const blockedRequests: DeferredPromise<HeadRequestOutcome>[] = [];
+    headRequestCheck.mockImplementation((url) => {
+      if (url.endsWith('/1')) {
+        return Promise.resolve({ kind: 'success', httpStatus: 200 });
+      }
+
+      const blockedRequest = createDeferredPromise<HeadRequestOutcome>();
+      blockedRequests.push(blockedRequest);
+      return blockedRequest.promise;
+    });
     resultDelayWait.mockRejectedValueOnce(
       new Error('Sensitive internal delay failure'),
     );
 
     const failedJobReference = jobsService.create(
-      createUrlList('internal-failure', 2),
+      createUrlList('internal-failure', 6),
     );
     await waitForJobStatus(jobsService, failedJobReference.jobId, 'failed');
 
     const failedJob = jobsService.findOne(failedJobReference.jobId);
+    expect(failedJob.urlChecks).toHaveLength(6);
+    expect(failedJob.urlChecks.every(({ status }) => status === 'error')).toBe(
+      true,
+    );
     expect(
-      failedJob.urlChecks.some(
-        ({ errorMessage }) => errorMessage === 'Internal job processing error',
+      failedJob.urlChecks.every(
+        ({ errorMessage }) =>
+          errorMessage === 'Job processing failed unexpectedly',
       ),
     ).toBe(true);
-    expect(
-      failedJob.urlChecks.filter(({ status }) =>
-        ['pending', 'in_progress'].includes(status),
-      ),
-    ).toHaveLength(0);
     expect(JSON.stringify(failedJob)).not.toContain('Sensitive internal');
+    expect(errorLogger).toHaveBeenCalledTimes(1);
     expect(errorLogger).toHaveBeenCalledWith(
       expect.objectContaining({
         event: 'job_processing_failed',
@@ -250,6 +419,85 @@ describe('JobsService merged processing boundaries', () => {
         errorName: 'Error',
       }),
       expect.stringContaining('Sensitive internal delay failure'),
+    );
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'url_check_state_changed',
+        jobId: failedJobReference.jobId,
+      }),
+    );
+
+    for (const blockedRequest of blockedRequests) {
+      blockedRequest.resolve({ kind: 'success', httpStatus: 200 });
+    }
+    await flushAsynchronousWork();
+
+    expect(
+      jobsService
+        .findOne(failedJobReference.jobId)
+        .urlChecks.every(({ status }) => status === 'error'),
+    ).toBe(true);
+
+    headRequestCheck.mockResolvedValue({ kind: 'success', httpStatus: 204 });
+    resultDelayWait.mockResolvedValue(undefined);
+    const independentJobReference = jobsService.create([
+      'https://healthy-after-failure.example/1',
+    ]);
+    await waitForJobStatus(
+      jobsService,
+      independentJobReference.jobId,
+      'completed',
+    );
+
+    expect(jobsService.findOne(independentJobReference.jobId)).toMatchObject({
+      status: 'completed',
+      urlChecks: [
+        expect.objectContaining({ status: 'success', httpStatus: 204 }),
+      ],
+    });
+    expect(errorLogger).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a cancelled job cancelled after a late internal failure', async () => {
+    const controlledRequest = createDeferredPromise<HeadRequestOutcome>();
+    headRequestCheck.mockReturnValue(controlledRequest.promise);
+    resultDelayWait.mockRejectedValue(
+      new Error('Sensitive cancelled job failure'),
+    );
+
+    const { jobId } = jobsService.create([
+      'https://cancelled-internal-failure.example/1',
+    ]);
+    await flushAsynchronousWork();
+    expect(headRequestCheck).toHaveBeenCalledTimes(1);
+
+    jobsService.cancel(jobId);
+    controlledRequest.resolve({ kind: 'success', httpStatus: 200 });
+    await waitForUrlChecksToFinish(jobsService, jobId);
+
+    const cancelledJob = jobsService.findOne(jobId);
+    expect(cancelledJob.status).toBe('cancelled');
+    expect(cancelledJob.urlChecks[0]).toMatchObject({
+      status: 'error',
+      errorMessage: 'Job processing failed unexpectedly',
+    });
+    expect(typeof cancelledJob.urlChecks[0].completedAt).toBe('string');
+    expect(JSON.stringify(cancelledJob)).not.toContain('Sensitive cancelled');
+    expect(errorLogger).not.toHaveBeenCalled();
+    expect(warningLogger).toHaveBeenCalledWith(
+      expect.stringContaining(
+        '"event":"job_processing_failure_after_cancellation"',
+      ),
+    );
+    expect(warningLogger).toHaveBeenCalledWith(
+      expect.stringContaining(`"jobId":"${jobId}"`),
+    );
+    expect(debugLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'url_check_state_changed',
+        jobId,
+        nextState: 'error',
+      }),
     );
   });
 });
